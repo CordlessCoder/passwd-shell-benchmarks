@@ -9,7 +9,7 @@ use std::{
 
 use ahash::AHashMap;
 use bstr::ByteSlice;
-use memchr::memrchr;
+use memchr::{memchr_iter, memrchr};
 use memmap2::{Mmap, MmapOptions};
 
 const PATH: &str = "passwd";
@@ -17,6 +17,33 @@ const PATH: &str = "passwd";
 const LINE_FEED: u8 = b'\n';
 
 const EFFICIENT_CORE_DIVISOR: usize = 6;
+
+const ENTRIES: usize = 128;
+type COUNT = u64;
+
+struct BadHash<'a> {
+    values: Vec<(Option<&'a [u8]>, COUNT)>,
+}
+impl<'a> BadHash<'a> {
+    pub fn new() -> Self {
+        BadHash {
+            values: Vec::from_iter((0..ENTRIES).map(|_| (None, 0))),
+        }
+    }
+    pub fn get(&mut self, key: &'a [u8]) -> &mut COUNT {
+        let id = Self::id(key);
+        let val = &mut self.values[id];
+        val.0 = Some(key);
+        &mut val.1
+    }
+    fn id(key: &[u8]) -> usize {
+        let len = key.len();
+        (key[len - 3] as usize ^ (len + key[len - 4] as usize)) & 0xabcdff
+    }
+    fn into_vec(self) -> Vec<(Option<&'a [u8]>, COUNT)> {
+        self.values
+    }
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -50,32 +77,43 @@ fn main() {
 
     let thread_configs = ThreadConfig::generate_chunked(&mapped, thread_count, LINE_FEED).unwrap();
 
-    let hashmap = scope(|s| {
+    let map = scope(|s| {
         let mapped = &mapped;
         let threads: Vec<_> = thread_configs
             .into_iter()
             .map(|config| s.spawn(move || config.run(mapped)))
             .collect();
         let mut threads = threads.into_iter();
-        let mut hashmap = threads.next().unwrap().join().unwrap().unwrap();
+        let mut map = threads.next().unwrap().join().unwrap().into_vec();
         threads
             .try_for_each(|handle| -> Result<(), Box<dyn Any + Send + 'static>> {
-                handle.join()?.unwrap().into_iter().for_each(|(k, v)| {
-                    hashmap
-                        .entry(k)
-                        .and_modify(|count| *count += v)
-                        .or_insert(v);
-                });
+                handle
+                    .join()?
+                    .into_vec()
+                    .into_iter()
+                    .enumerate()
+                    .for_each(|(i, (k, v))| {
+                        if let Some(k) = k {
+                            let entry = &mut map[i];
+                            entry.1 += v;
+                            entry.0 = Some(k);
+                        }
+                    });
                 Ok(())
             })
             .unwrap();
-        hashmap
+        map
     });
 
     let mut stdout = stdout().lock();
-    hashmap.into_iter().for_each(|(shell, count)| {
-        let _ = stdout.write_fmt(format_args!("{}: {count}\n", UnsafeBytes(&shell)));
+    map.into_iter().for_each(|(name, count)| {
+        if let Some(name) = name {
+            let _ = stdout.write_fmt(format_args!("{}: {count}\n", UnsafeBytes(&name)));
+        }
     });
+    // hashmap.into_iter().for_each(|(shell, count)| {
+    //     let _ = stdout.write_fmt(format_args!("{}: {count}\n", UnsafeBytes(&shell)));
+    // });
 }
 
 #[repr(transparent)]
@@ -93,23 +131,25 @@ struct ThreadConfig {
 }
 
 impl ThreadConfig {
-    pub fn run(self, map: &Mmap) -> io::Result<AHashMap<Vec<u8>, u32>> {
+    pub fn run(self, mapped: &Mmap) -> BadHash {
         let (start, length) = (self.start as usize, self.length as usize);
-        let _ = map.advise_range(memmap2::Advice::Sequential, start, length);
-        let mut hashmap = AHashMap::with_capacity(32);
+        let _ = mapped.advise_range(memmap2::Advice::Sequential, start, length);
+        let mut map = BadHash::new();
 
-        let owned: &[u8] = unsafe { map.get_unchecked(start..start + length) };
-        owned.lines().for_each(|line| {
-            if let Some(colon_idx) = memrchr(b':', line) {
-                let shell = &line[colon_idx + 1..];
-                hashmap
-                    .raw_entry_mut()
-                    .from_key(shell)
-                    .and_modify(|_, v| *v += 1)
-                    .or_insert_with(|| (shell.to_vec(), 1));
-            };
+        let owned: &[u8] = unsafe { mapped.get_unchecked(start..start + length) };
+        let mut start = 0;
+        memchr_iter(b'\n', &owned).for_each(|end| {
+            let line = unsafe { owned.get_unchecked(start..end) };
+            let Some(colon_idx) = memrchr(b':', line).map(|x|x+1) else {
+            return ()
+        };
+            let shell = unsafe { line.get_unchecked(colon_idx..) };
+
+            *map.get(shell) += 1;
+
+            start = end + 1;
         });
-        Ok(hashmap)
+        map
     }
 
     pub fn generate_chunked(map: &Mmap, thread_count: u64, sep: u8) -> std::io::Result<Vec<Self>> {

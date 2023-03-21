@@ -8,34 +8,70 @@ use std::{
     io::{stdout, Write},
 };
 
-use ahash::AHashMap;
 use bstr::ByteSlice;
-use memchr::memrchr;
+// use ahash::AHashMap;
+// use bstr::ByteSlice;
+use memchr::{memchr_iter, memrchr};
 use memmap2::Mmap;
+
+// Bad and unsafe, but very fast shell associative store. Stolen from C.
+struct Shells {}
 
 fn main() {
     const FILE: &str = "passwd";
 
     let file = File::open(FILE).expect("failed to read {FILE}");
     let mapped = unsafe { Mmap::map(&file).unwrap() };
-    //
-    let mut hs = AHashMap::with_capacity(32); // Initial capacity 32 performed the best at the time
-                                              // of testing, probably a fragile optimization
+    // let mut hs = AHashMap::with_capacity(32); // Initial capacity 32 performed the best at the time
+    //                                           // of testing, probably a fragile optimization
+
+    const ENTRIES: usize = 128;
+    type COUNT = u64;
+
+    struct BadHash<'a> {
+        values: Vec<(Option<&'a [u8]>, COUNT)>,
+    }
+    impl<'a> BadHash<'a> {
+        pub fn new() -> Self {
+            BadHash {
+                values: Vec::from_iter((0..ENTRIES).map(|_| (None, 0))),
+            }
+        }
+        pub fn get(&mut self, key: &'a [u8]) -> &mut COUNT {
+            let id = Self::id(key);
+            let val = &mut self.values[id];
+            val.0 = Some(key);
+            &mut val.1
+        }
+        fn id(key: &[u8]) -> usize {
+            let len = key.len();
+            (key[len - 3] as usize ^ (len + key[len - 4] as usize)) & 0xabcdff
+        }
+        fn into_vec(self) -> Vec<(Option<&'a [u8]>, COUNT)> {
+            self.values
+        }
+    }
+
+    let mut map = BadHash::new();
     let mut stdout = stdout().lock();
-    mapped.lines().for_each(|line| {
-        let colon_idx = memrchr(b':', line).unwrap_or(0);
+    let mut start = 0;
+    memchr_iter(b'\n', &mapped).for_each(|end| {
+        let line = unsafe { mapped.get_unchecked(start..end) };
+        let Some(colon_idx) = memrchr(b':', line).map(|x|x+1) else {
+            return ()
+        };
+        let shell = unsafe { line.get_unchecked(colon_idx..) };
 
-        let shell = &line[colon_idx + 1..];
-        hs.raw_entry_mut()
-            .from_key(shell)
-            // .from_key(&line[colon_idx + 1..])
-            .and_modify(|_, v| *v += 1)
-            .or_insert_with(|| (shell.to_vec(), 1));
+        *map.get(shell) += 1;
+
+        start = end + 1;
     });
 
-    hs.into_iter().for_each(|(shell, count)| {
-        let _ = stdout.write_fmt(format_args!("{}: {count}\n", UnsafeBytes(&shell)));
-    });
+    map.into_vec().into_iter().for_each(|(name, count)| {
+        if let Some(name) = name {
+            let _ = stdout.write_fmt(format_args!("{}: {count}\n", UnsafeBytes(&name)));
+        }
+    })
 }
 
 #[repr(transparent)]
